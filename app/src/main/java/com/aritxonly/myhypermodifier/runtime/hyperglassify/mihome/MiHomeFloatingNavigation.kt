@@ -1,0 +1,1159 @@
+package com.aritxonly.myhypermodifier
+
+import android.app.Activity
+import android.content.Context
+import android.content.res.Configuration
+import android.graphics.PixelFormat
+import android.graphics.Paint
+import android.graphics.PorterDuff
+import android.graphics.PorterDuffColorFilter
+import android.graphics.drawable.Drawable
+import android.os.SystemClock
+import android.util.Log
+import android.view.Gravity
+import android.view.MotionEvent
+import android.view.View
+import android.view.ViewGroup
+import android.view.ViewTreeObserver
+import android.view.WindowManager
+import android.widget.ImageView
+import android.widget.RelativeLayout
+import android.widget.TextView
+import androidx.compose.foundation.Image
+import androidx.compose.foundation.layout.Box
+import androidx.compose.foundation.layout.fillMaxWidth
+import androidx.compose.foundation.layout.height
+import androidx.compose.foundation.layout.navigationBarsPadding
+import androidx.compose.foundation.layout.padding
+import androidx.compose.material3.MaterialTheme
+import androidx.compose.runtime.Composable
+import androidx.compose.runtime.CompositionLocalProvider
+import androidx.compose.runtime.getValue
+import androidx.compose.runtime.mutableStateOf
+import androidx.compose.runtime.remember
+import androidx.compose.runtime.setValue
+import androidx.compose.ui.Alignment
+import androidx.compose.ui.Modifier
+import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.graphics.ColorFilter
+import androidx.compose.ui.graphics.toArgb
+import androidx.compose.ui.graphics.painter.Painter
+import androidx.compose.ui.graphics.vector.ImageVector
+import androidx.compose.ui.graphics.vector.rememberVectorPainter
+import androidx.compose.ui.graphics.painter.BitmapPainter
+import androidx.compose.ui.layout.ContentScale
+import androidx.compose.ui.layout.onGloballyPositioned
+import androidx.compose.ui.layout.positionOnScreen
+import androidx.compose.ui.platform.ComposeView
+import androidx.compose.ui.platform.LocalDensity
+import androidx.compose.ui.viewinterop.AndroidView
+import androidx.compose.ui.platform.ViewCompositionStrategy
+import androidx.compose.ui.unit.dp
+import androidx.lifecycle.setViewTreeLifecycleOwner
+import androidx.lifecycle.setViewTreeViewModelStoreOwner
+import androidx.savedstate.setViewTreeSavedStateRegistryOwner
+import com.aritxonly.deadliner.ui.navigation.MiuixFloatingTabBar
+import com.aritxonly.deadliner.ui.navigation.MiuixFloatingTabBarDefaults
+import com.aritxonly.deadliner.ui.navigation.MiuixFloatingTabBarGeometry
+import com.aritxonly.deadliner.ui.navigation.MiuixFloatingTabItem
+import com.aritxonly.deadliner.ui.navigation.MiuixFloatingTabLayout
+import com.aritxonly.deadliner.ui.theme.AdvancedMaterialSpec
+import com.aritxonly.deadliner.ui.theme.LocalAdvancedMaterialSpec
+import java.lang.reflect.Field
+import java.util.IdentityHashMap
+import java.lang.ref.WeakReference
+import java.util.WeakHashMap
+import kotlin.math.roundToInt
+import top.yukonga.miuix.kmp.blur.rememberLayerBackdrop
+import top.yukonga.miuix.kmp.icon.MiuixIcons
+import top.yukonga.miuix.kmp.icon.extended.All
+import top.yukonga.miuix.kmp.icon.extended.AppRecording
+import top.yukonga.miuix.kmp.icon.extended.ContactsCircle
+import top.yukonga.miuix.kmp.icon.extended.Home
+import top.yukonga.miuix.kmp.icon.extended.SearchDevice
+import top.yukonga.miuix.kmp.theme.MiuixTheme
+
+private const val MI_HOME_TAB_LAYOUT_CLASS =
+    "com.xiaomi.smarthome.newui.buttomtab.TabPageIndicatorNew"
+private const val MI_HOME_VIEW_PAGER_CLASS = "com.xiaomi.smarthome.ui.LinearViewPager"
+private const val MI_HOME_SCENE_TAB_CLASS = "com.xiaomi.smarthome.scene.SceneTabFragment"
+private const val MI_HOME_SCENE_LIST_CLASS =
+    "com.xiaomi.smarthome.scene.ui.list.MySceneFragmentkt"
+private const val MI_HOME_EDIT_MASK_CLASS =
+    "com.xiaomi.smarthome.newui.mainpage.EditMaskView"
+private const val MI_HOME_MICO_ACTION_BAR_CLASS =
+    "com.xiaomi.mico.common.editorbar.ActionBar"
+private const val MI_HOME_MICO_ACTION_MENU_CLASS =
+    "com.xiaomi.mico.common.editorbar.ActionMenu"
+
+/** Replaces Mi Home's visual tab strip while keeping its native routing and analytics intact. */
+internal object MiHomeFloatingNavigation {
+    private val hosts = WeakHashMap<Activity, WeakReference<MiHomeNavigationHost>>()
+    private val pendingAttachments = WeakHashMap<Activity, Runnable>()
+    private val startupSuppressors = WeakHashMap<Activity, EarlyBottomBarSuppressor>()
+
+    /** Starts immersion before Mi Home inflates its first frame. */
+    @JvmStatic
+    fun prepare(activity: Activity) {
+        if (activity.isFinishing || activity.isDestroyed || hosts[activity]?.get() != null ||
+            pendingAttachments.containsKey(activity) || startupSuppressors.containsKey(activity)
+        ) return
+
+        ModuleSettings.loadImmediately(activity.applicationContext)
+        if (ModuleSettings.isLoaded() && !ModuleSettings.miHomeFloatingNavigationEnabled) return
+        val startupLayout = MiHomeEarlyImmersiveLayout(activity)
+        startupSuppressors[activity] = EarlyBottomBarSuppressor(
+            activity = activity,
+            findBottomBar = {
+                activity.window.decorView.findDescendantByClassName(MI_HOME_TAB_LAYOUT_CLASS)
+            },
+            onSuppress = startupLayout::suppress,
+            onRestore = startupLayout::restore,
+        ).also(EarlyBottomBarSuppressor::start)
+    }
+
+    @JvmStatic
+    fun attach(activity: Activity) {
+        if (activity.isFinishing || activity.isDestroyed || hosts[activity]?.get() != null ||
+            pendingAttachments.containsKey(activity)
+        ) return
+
+        ModuleSettings.markLoaded(activity.applicationContext)
+        if (ModuleSettings.isLoaded() && !ModuleSettings.miHomeFloatingNavigationEnabled) {
+            startupSuppressors.remove(activity)?.restore()
+            return
+        }
+        prepare(activity)
+        val suppressor = startupSuppressors[activity] ?: return
+        val startedAt = SystemClock.uptimeMillis()
+        lateinit var retry: Runnable
+        retry = Runnable {
+            if (activity.isFinishing || activity.isDestroyed) {
+                pendingAttachments.remove(activity)
+                startupSuppressors.remove(activity)?.restore()
+                return@Runnable
+            }
+            ModuleSettings.markLoaded(activity.applicationContext)
+            if (ModuleSettings.isLoaded() && !ModuleSettings.miHomeFloatingNavigationEnabled) {
+                pendingAttachments.remove(activity)
+                startupSuppressors.remove(activity)?.restore()
+                return@Runnable
+            }
+            // Restore and create in one main-thread turn. This lets the host capture the genuine
+            // native alpha while keeping the original bar out of every rendered frame.
+            suppressor.restore()
+            val host = MiHomeNavigationHost.create(activity)
+            if (host == null && SystemClock.uptimeMillis() - startedAt < VIEW_WAIT_TIMEOUT_MS) {
+                suppressor.start()
+                activity.window.decorView.postDelayed(retry, VIEW_RETRY_MS)
+                return@Runnable
+            }
+            pendingAttachments.remove(activity)
+            startupSuppressors.remove(activity)
+            if (host == null) {
+                Log.w(TAG, "Mi Home 11.8.605 navigation views were not found")
+            } else {
+                hosts[activity] = WeakReference(host)
+            }
+        }
+        pendingAttachments[activity] = retry
+        activity.window.decorView.post(retry)
+    }
+
+    @JvmStatic
+    fun dispose(activity: Activity) {
+        pendingAttachments.remove(activity)?.let(activity.window.decorView::removeCallbacks)
+        startupSuppressors.remove(activity)?.restore()
+        hosts.remove(activity)?.get()?.dispose()
+    }
+
+    @JvmStatic
+    fun onTouchEvent(activity: Activity, event: MotionEvent) {
+        hosts[activity]?.get()?.onTouchEvent(event)
+    }
+
+    @JvmStatic
+    fun onActionModeStarted(activity: Activity, mode: Any) {
+        hosts[activity]?.get()?.onActionModeStarted(mode)
+    }
+
+    @JvmStatic
+    fun onActionModeFinished(activity: Activity, mode: Any) {
+        hosts[activity]?.get()?.onActionModeFinished(mode)
+    }
+
+    @JvmStatic fun setForeground(activity: Activity, value: Boolean) {
+        hosts[activity]?.get()?.setForeground(value)
+    }
+
+    private const val VIEW_RETRY_MS = 16L
+    private const val VIEW_WAIT_TIMEOUT_MS = 6_000L
+    private const val TAG = "MyHyperModifier"
+}
+
+private data class MiHomeTabState(
+    val label: String,
+    val tag: String,
+    val badge: Boolean,
+    val icons: NativeTabIconPair?,
+    val lottie: MiHomeLottieSpec?,
+    val staticIcon: MiHomeDrawableIconSpec?,
+)
+
+private data class MiHomeLottieSpec(
+    val viewClass: Class<*>,
+    val selectedResourceId: Int,
+    val unselectedResourceId: Int,
+    val settleWithoutAnimationResourceId: Int?,
+)
+
+/** A cloneable, stateful copy of an OEM ImageView source that Compose can host directly. */
+private data class MiHomeDrawableIconSpec(
+    val constantState: Drawable.ConstantState,
+    val state: IntArray,
+    val level: Int,
+    val tint: android.content.res.ColorStateList?,
+    val tintMode: PorterDuff.Mode?,
+    val colorFilter: android.graphics.ColorFilter?,
+    val imageAlpha: Int,
+    val viewAlpha: Float,
+    val scaleType: ImageView.ScaleType,
+    val backgroundTint: android.content.res.ColorStateList?,
+    val backgroundTintMode: PorterDuff.Mode?,
+    val usesBackground: Boolean,
+)
+
+private data class MiHomeNavigationState(
+    val tabs: List<MiHomeTabState> = emptyList(),
+    val selectedIndex: Int = 0,
+    val visible: Boolean = false,
+    val navigationLiftDp: Float = 24f,
+    val navigationInsetPx: Int = 0,
+)
+
+private class MiHomeNavigationHost private constructor(
+    private val activity: Activity,
+    private val overlayParent: ViewGroup,
+    private val nativeTabLayout: View,
+    private val contentView: View,
+    samplingView: View,
+) {
+    private var foreground = true
+    private var state by mutableStateOf(MiHomeNavigationState())
+    private val activeActionModes = IdentityHashMap<Any, Boolean>()
+    private var contextualActionBarVisible = false
+    // 11.8.605 inflates the scene selection title/menu and card editor menu as ordinary Views.
+    // They never dispatch Activity.onActionModeStarted and have no ActionBarContextView.
+    private val contextualViewIds = setOf("eah", "caj", "ar3").mapNotNull { name ->
+        activity.resources.getIdentifier(name, "id", activity.packageName).takeIf { it != 0 }
+    }.toSet()
+    private var backdropSnapshot by mutableStateOf<ViewBackdropSnapshot?>(null)
+    private val owner = InjectedViewTreeOwner()
+    private val windowImmersion = InjectedBottomNavigationImmersion(activity)
+    private val windowManager = activity.getSystemService(Context.WINDOW_SERVICE) as WindowManager
+    private val composeView = ComposeView(activity)
+    private val visibility = FloatingNavigationVisibility(composeView, windowManager)
+    private val overlayAnchor = NativeTabOverlayAnchor(overlayParent, composeView, windowManager)
+    private val stableNavigationInset = StableNavigationBarInset()
+    private var composeWindowAttached = false
+    private var lastNavigationDiagnostic: String? = null
+    private val settingsRefreshRunnable = object : Runnable {
+        override fun run() {
+            if (!composeWindowAttached || activity.isFinishing || activity.isDestroyed) return
+            if (!ModuleSettings.isLoaded()) {
+                ModuleSettings.markLoaded(activity.applicationContext)
+                composeView.postDelayed(this, 250L)
+            }
+        }
+    }
+    private val sampler = WindowGpuBackdropSampler(
+        source = samplingView,
+        excludedView = composeView,
+        window = activity.window,
+    ) { backdropSnapshot = it }
+    private val contentBottomPadding = InjectedScrollableContentBottomPadding(contentView)
+    private val iconSnapshotter = MiHomeTabIconSnapshotter(activity)
+    private val refreshPolicy = NavigationRefreshPolicy(100L)
+    private val startupCaptureRunnables = STARTUP_CAPTURE_DELAYS_MS.map {
+        Runnable {
+            if (composeWindowAttached && state.visible) sampler.requestCapture()
+        }
+    }
+    private val originalBottomAlpha = nativeTabLayout.alpha
+    private val originalBottomAccessibility = nativeTabLayout.importantForAccessibility
+    private val originalContentBottomMargin =
+        (contentView.layoutParams as? ViewGroup.MarginLayoutParams)?.bottomMargin
+    private val originalContentAboveRule =
+        (contentView.layoutParams as? RelativeLayout.LayoutParams)?.getRule(RelativeLayout.ABOVE) ?: 0
+    private var replacingNativeChrome = false
+    private val composeLayoutListener = View.OnLayoutChangeListener { view, _, _, _, _, _, _, _, _ ->
+        val contentInset = view.injectedNavigationContentInsetPx()
+        if (replacingNativeChrome && contentInset > 0 && contentBottomPadding.apply(contentInset)) {
+            sampler.requestCaptureBurst()
+        }
+    }
+    private val preDrawListener = ViewTreeObserver.OnPreDrawListener {
+        if (replacingNativeChrome && contentBottomPadding.ensureApplied()) {
+            sampler.requestCaptureBurst()
+        }
+        syncNativeState()
+        logNavigationGeometry()
+        sampler.onFrame()
+        true
+    }
+    private val globalLayoutListener = ViewTreeObserver.OnGlobalLayoutListener {
+        val visible = overlayParent.hasVisibleContextualActionBar(contextualViewIds)
+        if (contextualActionBarVisible != visible) {
+            contextualActionBarVisible = visible
+            syncNativeState(force = true)
+        }
+    }
+
+    init {
+        composeView.apply {
+            setViewTreeLifecycleOwner(owner)
+            setViewTreeViewModelStoreOwner(owner)
+            setViewTreeSavedStateRegistryOwner(owner)
+            setViewCompositionStrategy(ViewCompositionStrategy.DisposeOnDetachedFromWindow)
+            setContent {
+                MiHomeNavigationContent(
+                    state = state,
+                    backdropSnapshot = backdropSnapshot,
+                    onBackdropBoundsChanged = ::setBackdropScreenBounds,
+                    onDestinationSelected = ::selectDestination,
+                )
+            }
+        }
+        syncNativeState()
+        val overlayLayoutParams = WindowManager.LayoutParams(
+                ViewGroup.LayoutParams.MATCH_PARENT,
+                ViewGroup.LayoutParams.WRAP_CONTENT,
+                WindowManager.LayoutParams.TYPE_APPLICATION_PANEL,
+                WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE or
+                    WindowManager.LayoutParams.FLAG_NOT_TOUCH_MODAL or
+                    WindowManager.LayoutParams.FLAG_LAYOUT_NO_LIMITS,
+                PixelFormat.TRANSLUCENT,
+            ).apply {
+            gravity = Gravity.BOTTOM
+            token = activity.window.decorView.windowToken
+            title = "MyHyperModifier Mi Home navigation"
+            // Compose consumes navigationBarsPadding below. Do not let WindowManager position
+            // this attached panel above the same navigation inset first.
+            setFitInsetsTypes(0)
+        }
+        windowManager.addView(composeView, overlayLayoutParams)
+        composeWindowAttached = true
+        visibility.onAttached()
+        ModuleSettings.onLoaded {
+            composeView.post {
+                if (composeWindowAttached) syncNativeState(force = true)
+            }
+        }
+        composeView.post(settingsRefreshRunnable)
+        composeView.addOnLayoutChangeListener(composeLayoutListener)
+        overlayParent.viewTreeObserver.addOnPreDrawListener(preDrawListener)
+        overlayParent.viewTreeObserver.addOnGlobalLayoutListener(globalLayoutListener)
+        contextualActionBarVisible = overlayParent.hasVisibleContextualActionBar(contextualViewIds)
+        syncNativeState()
+        startupCaptureRunnables.forEachIndexed { index, runnable ->
+            composeView.postDelayed(runnable, STARTUP_CAPTURE_DELAYS_MS[index])
+        }
+    }
+
+    fun onTouchEvent(event: MotionEvent) = sampler.onTouchEvent(event)
+
+    fun onActionModeStarted(mode: Any) {
+        activeActionModes[mode] = true
+        syncNativeState(force = true)
+    }
+
+    fun onActionModeFinished(mode: Any) {
+        activeActionModes.remove(mode)
+        syncNativeState(force = true)
+    }
+
+    fun setForeground(value: Boolean) {
+        foreground = value
+        if (value) sampler.invalidateSamplingContext()
+        syncNativeState()
+    }
+
+    fun dispose() {
+        activeActionModes.clear()
+        overlayAnchor.dispose()
+        visibility.dispose()
+        sampler.dispose()
+        composeView.removeCallbacks(settingsRefreshRunnable)
+        startupCaptureRunnables.forEach(composeView::removeCallbacks)
+        composeView.removeOnLayoutChangeListener(composeLayoutListener)
+        contentBottomPadding.dispose()
+        if (overlayParent.viewTreeObserver.isAlive) {
+            overlayParent.viewTreeObserver.removeOnPreDrawListener(preDrawListener)
+            overlayParent.viewTreeObserver.removeOnGlobalLayoutListener(globalLayoutListener)
+        }
+        if (composeWindowAttached) {
+            runCatching { windowManager.removeViewImmediate(composeView) }
+            composeWindowAttached = false
+        }
+        nativeTabLayout.alpha = originalBottomAlpha
+        nativeTabLayout.importantForAccessibility = originalBottomAccessibility
+        restoreContentReservation()
+        windowImmersion.dispose()
+        owner.dispose()
+    }
+
+    private fun updateNativeChromeReplacement(enabled: Boolean) {
+        if (enabled) {
+            if (!replacingNativeChrome) {
+                replacingNativeChrome = true
+                windowImmersion.apply(composeView)
+            }
+            windowImmersion.ensureApplied()
+            removeContentReservation()
+            val contentInset = composeView.injectedNavigationContentInsetPx()
+            if (contentInset > 0 && contentBottomPadding.apply(contentInset)) {
+                sampler.requestCaptureBurst()
+            }
+        } else if (replacingNativeChrome) {
+            replacingNativeChrome = false
+            contentBottomPadding.dispose()
+            restoreContentReservation()
+            windowImmersion.dispose()
+        }
+        // The official tab layout remains in the hierarchy for routing and selection state.
+        // Its visual suppression must outlive a temporarily hidden floating panel.
+        if (ModuleSettings.miHomeFloatingNavigationEnabled) {
+            if (nativeTabLayout.alpha != 0f) nativeTabLayout.alpha = 0f
+            nativeTabLayout.importantForAccessibility =
+                View.IMPORTANT_FOR_ACCESSIBILITY_NO_HIDE_DESCENDANTS
+        } else {
+            if (nativeTabLayout.alpha != originalBottomAlpha) {
+                nativeTabLayout.alpha = originalBottomAlpha
+            }
+            nativeTabLayout.importantForAccessibility = originalBottomAccessibility
+        }
+    }
+
+    private fun removeContentReservation() {
+        removeMiHomeContentReservation(contentView)
+    }
+
+    private fun restoreContentReservation() {
+        when (val params = contentView.layoutParams) {
+            is RelativeLayout.LayoutParams -> {
+                var changed = false
+                if (params.getRule(RelativeLayout.ABOVE) != originalContentAboveRule) {
+                    params.removeRule(RelativeLayout.ABOVE)
+                    changed = true
+                }
+                if (originalContentAboveRule != 0 &&
+                    params.getRule(RelativeLayout.ABOVE) != originalContentAboveRule
+                ) {
+                    params.addRule(RelativeLayout.ABOVE, originalContentAboveRule)
+                }
+                originalContentBottomMargin?.let { margin ->
+                    if (params.bottomMargin != margin) {
+                        params.bottomMargin = margin
+                        changed = true
+                    }
+                }
+                if (changed) contentView.layoutParams = params
+            }
+            is ViewGroup.MarginLayoutParams -> originalContentBottomMargin?.let { margin ->
+                if (params.bottomMargin != margin) {
+                    params.bottomMargin = margin
+                    contentView.layoutParams = params
+                }
+            }
+        }
+    }
+
+    private fun syncNativeState(force: Boolean = false) {
+        if (!refreshPolicy.shouldRefresh(SystemClock.uptimeMillis(), force || state.tabs.isEmpty())) {
+            return
+        }
+        val tabs = nativeTabViews()
+        overlayAnchor.align(nativeTabLayout, tabs)
+        val selected = runCatching {
+            nativeTabLayout.javaClass.getMethod("getSelectedTabIndex")
+                .invoke(nativeTabLayout) as Int
+        }.getOrDefault(state.selectedIndex).coerceIn(0, (tabs.size - 1).coerceAtLeast(0))
+        val shouldRefreshIcons = state.tabs.size != tabs.size ||
+            state.tabs.isEmpty() || selected != state.selectedIndex
+        val tabStates = tabs.mapIndexed { index, tab ->
+            val cachedIcon = state.tabs.getOrNull(index)?.takeUnless { shouldRefreshIcons }
+                ?.let { MiHomeNativeIcon(it.icons, it.lottie, it.staticIcon) }
+            tab.readState(index, index == selected, cachedIcon)
+        }
+        val next = MiHomeNavigationState(
+            tabs = tabStates,
+            selectedIndex = selected,
+            visible = foreground && ModuleSettings.moduleHooksEnabled && ModuleSettings.miHomeFloatingNavigationEnabled &&
+                activity.hasWindowFocus() &&
+                nativeTabLayout.visibility == View.VISIBLE &&
+                nativeTabLayout.isShown && tabs.size > 1 && activeActionModes.isEmpty() &&
+                !contextualActionBarVisible &&
+                (tabStates.getOrNull(selected)?.isSceneTab() != true || !isSceneSelectionActive()),
+            navigationLiftDp = ModuleSettings.hyperGlassifyHiddenNavigationLift.coerceIn(0f, 48f),
+            navigationInsetPx = stableNavigationInset.bottomPx(
+                composeView, activity.window.decorView,
+            ),
+        )
+        val selectionChanged = next.selectedIndex != state.selectedIndex
+        val becameVisible = next.visible && !state.visible
+        if (next != state) state = next
+        if (selectionChanged) sampler.invalidateSamplingContext()
+        // Reserve immersive content space only while our dock or a contextual toolbar needs it.
+        updateNativeChromeReplacement(
+            foreground && ModuleSettings.moduleHooksEnabled && ModuleSettings.miHomeFloatingNavigationEnabled &&
+                (next.visible || activeActionModes.isNotEmpty() || contextualActionBarVisible),
+        )
+        visibility.setVisible(next.visible)
+        sampler.setActive(next.visible)
+        if (selectionChanged || becameVisible) sampler.requestCaptureBurst()
+    }
+
+    /** Mi Home 11.8.605 leaves the main tab strip visible during scene multi-selection. */
+    private fun isSceneSelectionActive(): Boolean {
+        val sceneTab = runCatching {
+            activity.javaClass.getMethod("getSceneTabPage").invoke(activity)
+        }.getOrNull()?.takeIf { it.javaClass.name == MI_HOME_SCENE_TAB_CLASS } ?: return false
+        val sceneList = sceneTab.readField("OoooO0")
+            ?.takeIf { it.javaClass.name == MI_HOME_SCENE_LIST_CLASS } ?: return false
+        // MySceneFragmentkt's selection controller drives both the top and bottom edit bars.
+        return sceneList.readField("OoooO0O")?.readField("OooO00o") == true
+    }
+
+    private fun logNavigationGeometry() {
+        if (!composeWindowAttached || !state.visible) return
+        val location = IntArray(2)
+        composeView.getLocationOnScreen(location)
+        val message = "MiHomeNav geometry lift=${state.navigationLiftDp} loaded=${ModuleSettings.isLoaded()} " +
+            "settings=${ModuleSettings.loadStatus()} " +
+            "panelY=${location[1]} panelHeight=${composeView.height} " +
+            "panelNavInset=${composeView.rootWindowInsets?.systemWindowInsetBottom ?: -1}"
+        if (message != lastNavigationDiagnostic) {
+            lastNavigationDiagnostic = message
+            Log.i("MyHyperModifier", message)
+        }
+    }
+
+    private fun setBackdropScreenBounds(screenBounds: ViewBackdropBounds) {
+        val decorLocation = IntArray(2)
+        activity.window.decorView.getLocationOnScreen(decorLocation)
+        sampler.setNavigationBounds(
+            screenBounds.copy(
+                left = screenBounds.left - decorLocation[0],
+                top = screenBounds.top - decorLocation[1],
+            ),
+        )
+    }
+
+    private fun View.readState(
+        index: Int,
+        selected: Boolean,
+        cachedIcon: MiHomeNativeIcon? = null,
+    ): MiHomeTabState {
+        val label = (readField("mText") as? TextView)?.text?.toString().orEmpty()
+            .ifBlank { FALLBACK_LABELS.getOrElse(index) { "入口 ${index + 1}" } }
+        val tag = readField("mViewTag")?.toString().orEmpty()
+        val badge = runCatching {
+            javaClass.getMethod("getShowPoint").invoke(this) as Boolean
+        }.getOrDefault(false)
+        val nativeIcon = cachedIcon ?: iconSnapshotter.read(this, selected)
+        return MiHomeTabState(
+            label = label,
+            tag = tag,
+            badge = ModuleSettings.miHomeNavigationBadgesEnabled && badge,
+            icons = nativeIcon.icons,
+            lottie = nativeIcon.lottie,
+            staticIcon = nativeIcon.staticIcon,
+        )
+    }
+
+    private fun selectDestination(index: Int) {
+        val tab = nativeTabViews().getOrNull(index) ?: return
+        if (index != state.selectedIndex) sampler.invalidateSamplingContext()
+        state = state.copy(selectedIndex = index)
+        tab.performClick()
+        tab.post { syncNativeState(force = true) }
+        sampler.requestCaptureBurst()
+    }
+
+    private fun nativeTabViews(): List<View> = runCatching {
+        (nativeTabLayout.javaClass.getMethod("getTabViewList")
+            .invoke(nativeTabLayout) as? List<*>)?.filterIsInstance<View>().orEmpty()
+    }.getOrDefault(emptyList()).ifEmpty {
+        (nativeTabLayout as? ViewGroup)?.let { parent ->
+            List(parent.childCount) { parent.getChildAt(it) }
+        }.orEmpty()
+    }
+
+    companion object {
+        private val FALLBACK_LABELS = listOf("设备", "智能", "发现", "我的")
+        private val STARTUP_CAPTURE_DELAYS_MS = longArrayOf(120L, 320L, 700L, 1_200L, 1_800L)
+
+        fun create(activity: Activity): MiHomeNavigationHost? = runCatching {
+            val overlayParent = activity.window.decorView as? ViewGroup ?: return null
+            val tabLayout = overlayParent.findDescendantByClassName(MI_HOME_TAB_LAYOUT_CLASS)
+                ?: return null
+            val content = overlayParent.findDescendantByClassName(MI_HOME_VIEW_PAGER_CLASS)
+                ?: return null
+            MiHomeNavigationHost(
+                activity = activity,
+                overlayParent = overlayParent,
+                nativeTabLayout = tabLayout,
+                contentView = content,
+                samplingView = overlayParent,
+            )
+        }.onFailure {
+            Log.e("MyHyperModifier", "Could not attach Mi Home navigation overlay", it)
+        }.getOrNull()
+    }
+}
+
+/** Removes Mi Home's native bottom reservation before its first frame, then restores for handoff. */
+private class MiHomeEarlyImmersiveLayout(private val activity: Activity) {
+    private val immersion = InjectedBottomNavigationImmersion(activity)
+    private val originalReservations = IdentityHashMap<View, MiHomeContentReservation>()
+    private var currentContent: View? = null
+
+    fun suppress() {
+        immersion.apply()
+        immersion.ensureApplied()
+        val content = currentContent?.takeIf(View::isAttachedToWindow)
+            ?: activity.window.decorView.findDescendantByClassName(MI_HOME_VIEW_PAGER_CLASS)
+                ?.also { currentContent = it }
+            ?: return
+        originalReservations.getOrPut(content) {
+            val params = content.layoutParams
+            MiHomeContentReservation(
+                bottomMargin = (params as? ViewGroup.MarginLayoutParams)?.bottomMargin,
+                aboveRule = (params as? RelativeLayout.LayoutParams)
+                    ?.getRule(RelativeLayout.ABOVE) ?: 0,
+            )
+        }
+        removeMiHomeContentReservation(content)
+    }
+
+    fun restore() {
+        originalReservations.forEach { (content, original) ->
+            when (val params = content.layoutParams) {
+                is RelativeLayout.LayoutParams -> {
+                    params.removeRule(RelativeLayout.ABOVE)
+                    if (original.aboveRule != 0) {
+                        params.addRule(RelativeLayout.ABOVE, original.aboveRule)
+                    }
+                    original.bottomMargin?.let { params.bottomMargin = it }
+                    content.layoutParams = params
+                }
+                is ViewGroup.MarginLayoutParams -> original.bottomMargin?.let { bottomMargin ->
+                    params.bottomMargin = bottomMargin
+                    content.layoutParams = params
+                }
+            }
+        }
+        originalReservations.clear()
+        currentContent = null
+        immersion.dispose()
+    }
+}
+
+private data class MiHomeContentReservation(
+    val bottomMargin: Int?,
+    val aboveRule: Int,
+)
+
+private fun removeMiHomeContentReservation(content: View) {
+    when (val params = content.layoutParams) {
+        is RelativeLayout.LayoutParams -> {
+            var changed = false
+            if (params.getRule(RelativeLayout.ABOVE) != 0) {
+                params.removeRule(RelativeLayout.ABOVE)
+                changed = true
+            }
+            if (params.bottomMargin != 0) {
+                params.bottomMargin = 0
+                changed = true
+            }
+            if (changed) content.layoutParams = params
+        }
+        is ViewGroup.MarginLayoutParams -> if (params.bottomMargin != 0) {
+            params.bottomMargin = 0
+            content.layoutParams = params
+        }
+    }
+}
+
+@Composable
+private fun MiHomeNavigationContent(
+    state: MiHomeNavigationState,
+    backdropSnapshot: ViewBackdropSnapshot?,
+    onBackdropBoundsChanged: (ViewBackdropBounds) -> Unit,
+    onDestinationSelected: (Int) -> Unit,
+) {
+    if (!state.visible || state.tabs.isEmpty()) return
+    val dark = (androidx.compose.ui.platform.LocalConfiguration.current.uiMode and
+        Configuration.UI_MODE_NIGHT_MASK) == Configuration.UI_MODE_NIGHT_YES
+    val materialColors = remember(dark) { MhmPresetColors.material(dark) }
+    val miuixColors = remember(dark, materialColors) { MhmPresetColors.miuix(materialColors, dark) }
+    val backdrop = rememberLayerBackdrop()
+    val hiddenNavigationLift = hyperGlassifyHiddenNavigationLift()
+    val navigationPadding = if (state.navigationInsetPx > 0) {
+        Modifier.padding(bottom = with(LocalDensity.current) { state.navigationInsetPx.toDp() })
+    } else {
+        Modifier.navigationBarsPadding()
+    }
+    val items = state.tabs.mapIndexed { index, tab ->
+        val useMiuixIcons = ModuleSettings.miHomeMiuixIconsEnabled
+        // Mi Home's glass navigation has one foreground-color contract. Keeping this fixed also
+        // makes the Marketplace ImageView follow selected/unselected tint just like every tab.
+        val monochromeEnabled = true
+        // Marketplace uses the original static ImageView directly. This avoids re-rasterizing
+        // its drawable, which is what made that OEM icon disappear in the Compose copy.
+        val originalMarketplaceIcon = tab.staticIcon?.takeIf { tab.isMarketplace() }
+        // Keep the rasterized native icon available even when a live Marketplace source exists.
+        // It is rendered underneath the live view so a late/blank OEM drawable cannot hide the
+        // whole tab icon.
+        val nativeIcons = tab.icons?.takeUnless { useMiuixIcons }
+        val nativeLottie = tab.lottie?.takeUnless { useMiuixIcons }
+        val monochrome = (nativeIcons != null || nativeLottie != null) && monochromeEnabled
+        val selectedPainter = nativeIcons?.let {
+            val bitmap = if (monochrome) it.selectedMonochrome else it.selected
+            remember(bitmap) { BitmapPainter(bitmap) }
+        } ?: rememberVectorPainter(miHomeIcon(tab, index))
+        val unselectedPainter = nativeIcons?.let {
+            val bitmap = if (monochrome) it.unselectedMonochrome else it.unselected
+            remember(bitmap) { BitmapPainter(bitmap) }
+        } ?: rememberVectorPainter(miHomeIcon(tab, index))
+        val liveIconContent: (@Composable (Boolean, Color) -> Unit)? =
+            originalMarketplaceIcon?.let { spec ->
+                { selected, tint ->
+                    MiHomeStaticIcon(
+                        spec = spec,
+                        selected = selected,
+                        tint = tint,
+                        selectedFallback = selectedPainter,
+                        unselectedFallback = unselectedPainter,
+                    )
+                }
+            } ?: nativeLottie?.let { spec ->
+                { selected, tint ->
+                    MiHomeLottieIcon(
+                        spec = spec,
+                        selected = selected,
+                        tint = if (monochrome) tint else Color.Unspecified,
+                    )
+                }
+            }
+        MiuixFloatingTabItem(
+            key = index.toString(),
+            label = tab.label,
+            selectedIcon = selectedPainter,
+            unselectedIcon = unselectedPainter,
+            preserveOriginalIconColors =
+                (nativeIcons != null || nativeLottie != null || originalMarketplaceIcon != null) &&
+                    !monochrome,
+            badge = if (tab.badge) "" else null,
+            iconContent = liveIconContent,
+        )
+    }
+
+    MaterialTheme(colorScheme = materialColors) {
+        MiuixTheme(colors = miuixColors) {
+            CompositionLocalProvider(
+                LocalAdvancedMaterialSpec provides navigationGlassMaterial(),
+            ) {
+                Box(
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .then(navigationPadding)
+                        .padding(
+                            start = 16.dp,
+                            top = INJECTED_NAVIGATION_SHADOW_TOP_PADDING,
+                            end = 16.dp,
+                            bottom = 4.dp + hiddenNavigationLift,
+                        )
+                        .height(
+                            MiuixFloatingTabBarGeometry.resolve("MiHome").heightDp?.dp
+                                ?: MiuixFloatingTabBarDefaults.Height,
+                        ),
+                    contentAlignment = Alignment.Center,
+                ) {
+                    ViewBackdropLayer(backdropSnapshot, backdrop)
+                    MiuixFloatingTabBar(
+                        items = items,
+                        selectedKey = state.selectedIndex.toString(),
+                        onItemSelected = { onDestinationSelected(it.key.toInt()) },
+                        modifier = Modifier.onGloballyPositioned { coordinates ->
+                            val position = coordinates.positionOnScreen()
+                            onBackdropBoundsChanged(
+                                ViewBackdropBounds(
+                                    left = position.x.roundToInt(),
+                                    top = position.y.roundToInt(),
+                                    width = coordinates.size.width,
+                                    height = coordinates.size.height,
+                                ),
+                            )
+                        },
+                        layout = MiuixFloatingTabLayout.Stacked,
+                        backdrop = backdropSnapshot?.let { backdrop },
+                        geometryKey = "MiHome",
+                    )
+                }
+            }
+        }
+    }
+}
+
+private fun MiHomeTabState.isMarketplace(): Boolean {
+    val identity = "$tag $label".lowercase()
+    return identity.contains("discover") || identity.contains("shop") ||
+        identity.contains("发现") || identity.contains("商城")
+}
+
+private fun MiHomeTabState.isSceneTab(): Boolean {
+    val identity = "$tag $label".lowercase()
+    return identity.contains("scene") || identity.contains("smart") ||
+        identity.contains("智能") || identity.contains("场景")
+}
+
+private fun miHomeIcon(tab: MiHomeTabState, index: Int): ImageVector {
+    val identity = "${tab.tag} ${tab.label}".lowercase()
+    return when {
+        identity.contains("device") || identity.contains("home") ||
+            identity.contains("设备") || identity.contains("首页") -> MiuixIcons.Home
+        identity.contains("smart") || identity.contains("scene") ||
+            identity.contains("智能") || identity.contains("场景") -> MiuixIcons.All
+        tab.isMarketplace() -> MiuixIcons.AppRecording
+        identity.contains("mine") || identity.contains("profile") ||
+            identity.contains("我的") -> MiuixIcons.ContactsCircle
+        else -> listOf(
+            MiuixIcons.Home,
+            MiuixIcons.All,
+            MiuixIcons.AppRecording,
+            MiuixIcons.ContactsCircle,
+            MiuixIcons.SearchDevice,
+        )[index.coerceIn(0, 4)]
+    }
+}
+
+private fun View.findDescendantByClassName(className: String): View? {
+    if (javaClass.name == className) return this
+    if (this is ViewGroup) {
+        repeat(childCount) { index ->
+            getChildAt(index).findDescendantByClassName(className)?.let { return it }
+        }
+    }
+    return null
+}
+
+private fun View.hasVisibleContextualActionBar(contextualViewIds: Set<Int>): Boolean {
+    val name = javaClass.name
+    val visible = isShown && alpha > 0f && width > 0 && height > 0
+    if (visible && (
+            id in contextualViewIds ||
+            name == MI_HOME_EDIT_MASK_CLASS ||
+            name == MI_HOME_MICO_ACTION_BAR_CLASS ||
+            name == MI_HOME_MICO_ACTION_MENU_CLASS ||
+            name.endsWith("ActionBarContextView") ||
+            name.endsWith("ActionModeView") ||
+            (this is TextView && MiHomeNavigationPolicy.isSelectionHeader(text))
+        )
+    ) return true
+    if (this is ViewGroup) {
+        repeat(childCount) { index ->
+            if (getChildAt(index).hasVisibleContextualActionBar(contextualViewIds)) return true
+        }
+    }
+    return false
+}
+
+private fun Any.readField(name: String): Any? {
+    var type: Class<*>? = javaClass
+    while (type != null) {
+        try {
+            val field: Field = type.getDeclaredField(name)
+            field.isAccessible = true
+            return field.get(this)
+        } catch (_: NoSuchFieldException) {
+            type = type.superclass
+        } catch (_: Throwable) {
+            return null
+        }
+    }
+    return null
+}
+
+/**
+ * Mi Home mixes ordinary ImageViews with LottieAnimationViews whose model IDs point to styles,
+ * not drawables. Snapshot the live native renderer chosen by TabView instead of decoding IDs.
+ */
+private data class MiHomeNativeIcon(
+    val icons: NativeTabIconPair?,
+    val lottie: MiHomeLottieSpec?,
+    val staticIcon: MiHomeDrawableIconSpec?,
+)
+
+private class MiHomeTabIconSnapshotter(activity: Activity) {
+    private val resources = activity.resources
+    private val delegate = NativeTabIconSnapshotter(activity.resources, activity.theme)
+    private val lottieFields = HashMap<Class<*>, MiHomeLottieFields>()
+    private val animationViewId = activity.resources.getIdentifier("e46", "id", activity.packageName)
+    private val staticViewId = activity.resources.getIdentifier("e48", "id", activity.packageName)
+
+    fun read(tab: View, selected: Boolean): MiHomeNativeIcon {
+        val animationView = (tab.readField("mAnimView") as? ImageView)
+            ?: animationViewId.takeIf { it != 0 }?.let(tab::findViewById)
+        val staticView = (tab.readField("mImageView") as? ImageView)
+            ?: staticViewId.takeIf { it != 0 }?.let(tab::findViewById)
+        // Some Marketplace builds do not retain the icon in either named field. Fall back to
+        // the actual drawable-bearing ImageView in this tab rather than substituting an icon.
+        val discoveredView = findNativeTabIconView(
+            root = tab,
+            preferredId = staticViewId,
+            excludedIds = emptySet(),
+        )
+        // DeviceAnimTabView owns separate Lottie files for selected and unselected states. Keep
+        // both: caching only getCurrentJson() freezes the Compose copy in whichever state happened
+        // to be active when it was first read.
+        val index = (tab.invokeNoArg("getIndex") as? Int) ?: 0
+        // Resolve a complete versioned layout once per class, never mix unrelated obfuscated
+        // fields. Read live values when selection changes so pin/home resources stay current.
+        val fields = lottieFields.getOrPut(tab.javaClass) { MiHomeLottieFields.resolve(tab.javaClass) }
+        val currentResource = (tab.invokeNoArg("getCurrentJson") as? Int).rawResourceOrNull()
+        val loadedResource = fields.loaded(tab).rawResourceOrNull()
+        val ordinaryUnselected = fields.unselected(tab, false).rawResourceOrNull()
+        val selectedCandidate = fields.selected(tab, index == 0)
+        val unselectedCandidate = fields.unselected(tab, index == 0)
+        val selectedResource = selectedCandidate.rawResourceOrNull()
+            ?: currentResource.takeIf { selected }
+            ?: loadedResource
+        val unselectedResource = unselectedCandidate.rawResourceOrNull()
+            ?: currentResource.takeIf { !selected }
+            ?: loadedResource
+        val source = listOfNotNull(animationView, staticView, discoveredView)
+            .distinct()
+            .filter { it.drawable != null || it.background != null }
+            .maxByOrNull { view ->
+                var score = if (view.visibility == View.VISIBLE) 10_000 else 0
+                if (view.isMiHomeLottieRenderer()) score += 1_000
+                score + maxOf(1, view.width) * maxOf(1, view.height)
+            }
+        // Resource IDs alone do not identify Lottie: static Marketplace tabs expose matching
+        // fields on some versions. Only invoke the Lottie renderer when the source View actually
+        // exposes its animation API.
+        if (animationView != null && animationView.isMiHomeLottieRenderer() &&
+            selectedResource != null && unselectedResource != null
+        ) {
+            return MiHomeNativeIcon(
+                icons = null,
+                lottie = MiHomeLottieSpec(
+                    viewClass = animationView.javaClass,
+                    selectedResourceId = selectedResource,
+                    unselectedResourceId = unselectedResource,
+                    settleWithoutAnimationResourceId = ordinaryUnselected,
+                ),
+                staticIcon = null,
+            )
+        }
+        return MiHomeNativeIcon(
+            icons = delegate.snapshot(tab, source, selected),
+            lottie = null,
+            staticIcon = source?.toMiHomeDrawableIconSpec(),
+        )
+    }
+
+    private fun Int?.rawResourceOrNull(): Int? = this?.takeIf { resourceId ->
+        resourceId > 0 && runCatching {
+            resources.getResourceTypeName(resourceId) == "raw"
+        }.getOrDefault(false)
+    }
+}
+
+private fun ImageView.isMiHomeLottieRenderer(): Boolean {
+    if (javaClass.name.contains("LottieAnimationView")) return true
+    var type: Class<*>? = javaClass
+    while (type != null) {
+        if (type.declaredMethods.any { method ->
+            method.name == "setAnimation" && method.parameterTypes.size == 1 &&
+                method.parameterTypes[0] == Int::class.javaPrimitiveType
+        }) return true
+        type = type.superclass
+    }
+    return false
+}
+
+private fun ImageView.toMiHomeDrawableIconSpec(): MiHomeDrawableIconSpec? {
+    val source = drawable ?: background ?: return null
+    val state = source.constantState ?: return null
+    return MiHomeDrawableIconSpec(
+        constantState = state,
+        state = source.state.clone(),
+        level = source.level,
+        tint = imageTintList,
+        tintMode = imageTintMode,
+        colorFilter = colorFilter,
+        imageAlpha = imageAlpha,
+        viewAlpha = alpha,
+        scaleType = scaleType,
+        backgroundTint = backgroundTintList,
+        backgroundTintMode = backgroundTintMode,
+        usesBackground = drawable == null,
+    )
+}
+
+@Composable
+private fun MiHomeStaticIcon(
+    spec: MiHomeDrawableIconSpec,
+    selected: Boolean,
+    tint: Color,
+    selectedFallback: Painter,
+    unselectedFallback: Painter,
+) {
+    Box(
+        modifier = Modifier
+            .fillMaxWidth()
+            .height(MiuixFloatingTabBarDefaults.TabIconSize),
+        contentAlignment = Alignment.Center,
+    ) {
+        // Mi Home's Marketplace ImageView can be captured before its drawable finishes loading.
+        // Keep the same-state native/raster fallback underneath so a blank static copy cannot
+        // remove the whole icon.
+        Image(
+            painter = if (selected) selectedFallback else unselectedFallback,
+            contentDescription = null,
+            modifier = Modifier
+                .fillMaxWidth()
+                .height(MiuixFloatingTabBarDefaults.TabIconSize),
+            contentScale = ContentScale.Fit,
+            colorFilter = tint.takeUnless { it == Color.Unspecified }?.let(ColorFilter::tint),
+        )
+        AndroidView(
+            factory = { context ->
+                ImageView(context).apply {
+                    scaleType = ImageView.ScaleType.FIT_CENTER
+                }
+            },
+            modifier = Modifier
+                .fillMaxWidth()
+                .height(MiuixFloatingTabBarDefaults.TabIconSize),
+            update = { imageView ->
+                runCatching {
+                    val copy = spec.constantState
+                        .newDrawable(imageView.resources, imageView.context.theme)
+                        .mutate()
+                        .apply {
+                            state = spec.state
+                            level = spec.level
+                        }
+                    // The original Drawable supplies the correct shape and state, while the glass
+                    // bar owns its foreground color.
+                    val colorFilter = PorterDuffColorFilter(tint.toArgb(), PorterDuff.Mode.SRC_IN)
+                    copy.colorFilter = colorFilter
+                    imageView.imageTintList =
+                        android.content.res.ColorStateList.valueOf(tint.toArgb())
+                    imageView.imageTintMode = PorterDuff.Mode.SRC_IN
+                    imageView.colorFilter = colorFilter
+                    imageView.imageAlpha = spec.imageAlpha
+                    imageView.alpha = spec.viewAlpha
+                    imageView.scaleType = spec.scaleType
+                    imageView.backgroundTintList =
+                        android.content.res.ColorStateList.valueOf(tint.toArgb())
+                    imageView.backgroundTintMode = PorterDuff.Mode.SRC_IN
+                    if (spec.usesBackground) {
+                        imageView.setImageDrawable(null)
+                        imageView.background = copy
+                    } else {
+                        imageView.background = null
+                        imageView.setImageDrawable(copy)
+                    }
+                }.onFailure {
+                    imageView.setImageDrawable(null)
+                    imageView.background = null
+                    imageView.alpha = 1f
+                }
+            },
+        )
+    }
+}
+
+private fun Any.invokeNoArg(name: String): Any? {
+    var type: Class<*>? = javaClass
+    while (type != null) {
+        try {
+            return type.getDeclaredMethod(name).apply { isAccessible = true }.invoke(this)
+        } catch (_: NoSuchMethodException) {
+            type = type.superclass
+        } catch (_: Throwable) {
+            return null
+        }
+    }
+    return null
+}
+
+@Composable
+private fun MiHomeLottieIcon(spec: MiHomeLottieSpec, selected: Boolean, tint: Color) {
+    AndroidView(
+        factory = { context -> createMiHomeLottieView(context, spec.viewClass) },
+        modifier = Modifier.fillMaxWidth().height(MiuixFloatingTabBarDefaults.TabIconSize),
+        update = { imageView ->
+            val previous = imageView.tag as? MiHomeLottieViewState
+            val resourceId = if (selected) {
+                spec.selectedResourceId
+            } else {
+                spec.unselectedResourceId
+            }
+            if (previous?.resourceId != resourceId || previous.selected != selected) {
+                runCatching {
+                    imageView.javaClass.getMethod("cancelAnimation").invoke(imageView)
+                    imageView.javaClass.getMethod(
+                        "setAnimation",
+                        Int::class.javaPrimitiveType,
+                    ).invoke(imageView, resourceId)
+                    imageView.javaClass.getMethod("setRepeatCount", Int::class.javaPrimitiveType)
+                        .invoke(imageView, 0)
+                    // Match Mi Home: initial icons and the ordinary unselected resource rest on
+                    // their final frame; selection (and the home-tab reverse resource) animates.
+                    if (previous == null || resourceId == spec.settleWithoutAnimationResourceId) {
+                        imageView.javaClass.getMethod(
+                            "setProgress",
+                            Float::class.javaPrimitiveType,
+                        ).invoke(imageView, 1f)
+                    } else {
+                        imageView.javaClass.getMethod("playAnimation").invoke(imageView)
+                    }
+                }
+            }
+            val tintArgb = tint.takeUnless { it == Color.Unspecified }?.toArgb()
+            if (previous?.tintArgb != tintArgb) {
+                if (tintArgb == null) {
+                    imageView.setLayerType(View.LAYER_TYPE_NONE, null)
+                } else {
+                    imageView.setLayerType(
+                        View.LAYER_TYPE_HARDWARE,
+                        Paint().apply {
+                            colorFilter = PorterDuffColorFilter(tintArgb, PorterDuff.Mode.SRC_IN)
+                        },
+                    )
+                }
+            }
+            imageView.tag = MiHomeLottieViewState(resourceId, selected, tintArgb)
+        },
+    )
+}
+
+private data class MiHomeLottieViewState(
+    val resourceId: Int,
+    val selected: Boolean,
+    val tintArgb: Int?,
+)
+
+private fun createMiHomeLottieView(context: Context, viewClass: Class<*>): ImageView =
+    runCatching {
+        (viewClass.getConstructor(Context::class.java).newInstance(context) as ImageView).apply {
+            scaleType = ImageView.ScaleType.CENTER_INSIDE
+        }
+    }.getOrElse {
+        ImageView(context).apply { scaleType = ImageView.ScaleType.CENTER_INSIDE }
+    }
