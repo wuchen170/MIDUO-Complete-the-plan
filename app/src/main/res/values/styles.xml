@@ -1,0 +1,20 @@
+<resources>
+    <!-- DayNight 变体在部分平台不存在（AAPT 链接失败），设置页为纯 Compose，用 DeviceDefault 即可。 -->
+    <style name="AppTheme" parent="android:style/Theme.DeviceDefault.NoActionBar">
+        <item name="android:windowActionModeOverlay">true</item>
+        <item name="android:windowLayoutInDisplayCutoutMode">shortEdges</item>
+    </style>
+
+    <!-- 相机内屏浮动按钮的窗口主题：必须是 floating 窗口，否则 wrap_content 会被撑满整屏，
+         把相机的触摸一起吞掉。Theme.Dialog 默认的最小宽高也要清零。 -->
+    <style name="PillDialog" parent="@android:style/Theme.Dialog">
+        <item name="android:windowBackground">@android:color/transparent</item>
+        <item name="android:windowIsFloating">true</item>
+        <item name="android:windowNoTitle">true</item>
+        <item name="android:backgroundDimEnabled">false</item>
+        <item name="android:windowAnimationStyle">@null</item>
+        <item name="android:windowContentOverlay">@null</item>
+        <item name="android:windowMinWidthMajor">0dip</item>
+        <item name="android:windowMinWidthMinor">0dip</item>
+    </style>
+</resources>
